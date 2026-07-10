@@ -1,4 +1,5 @@
 import os
+from datetime import date
 from typing import Callable, Iterator, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -39,6 +40,15 @@ supabase: Client = create_client(url, key)
 
 # Domain-Locked Isolation Configuration
 BANNED_CONSUMER_DOMAINS = ["gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "icloud.com", "aol.com"]
+
+# Budget Circuit Breaker Configuration
+DAILY_DEV_BUDGET_USD = float(os.getenv("DAILY_DEV_BUDGET_USD", "5.00"))
+ESTIMATED_COST_PER_1K_TOKENS_USD = float(os.getenv("ESTIMATED_COST_PER_1K_TOKENS_USD", "0.03"))
+CHARS_PER_TOKEN_ESTIMATE = 4
+
+# In-memory (workspace, day) -> cumulative estimated spend in USD. Resets naturally
+# as the date key rolls over; not persisted, so a process restart also resets it.
+_workspace_daily_spend: dict[tuple[str, date], float] = {}
 
 # Model string prefix -> provider routing table
 MODEL_PREFIX_ROUTES: dict[str, Provider] = {
@@ -92,6 +102,37 @@ def get_tenant_provider_key(company_name: str, provider: Provider) -> str:
     return decrypt_key(response.data[0]["encrypted_provider_key"])
 
 
+def _estimate_chunk_cost_usd(chunk: str) -> float:
+    """Rough token-cost estimate from raw character count; good enough to gate a budget, not to bill."""
+    estimated_tokens = max(1, len(chunk) / CHARS_PER_TOKEN_ESTIMATE)
+    return (estimated_tokens / 1000) * ESTIMATED_COST_PER_1K_TOKENS_USD
+
+
+def _record_spend(workspace: str, cost_usd: float) -> float:
+    """Adds cost_usd to today's ledger entry for workspace and returns the new running total."""
+    ledger_key = (workspace, date.today())
+    running_total = _workspace_daily_spend.get(ledger_key, 0.0) + cost_usd
+    _workspace_daily_spend[ledger_key] = running_total
+    return running_total
+
+
+def budget_circuit_breaker(chunks: Iterator[str], workspace: str) -> Iterator[str]:
+    """Meters every chunk against the workspace's daily dev budget. The instant the
+    running total crosses the threshold, breaks the loop and calls chunks.close(),
+    sending GeneratorExit into the upstream provider generator so its underlying
+    connection/socket is torn down immediately instead of continuing to stream
+    (and bill for) tokens the caller has already been cut off from."""
+    try:
+        for chunk in chunks:
+            running_total = _record_spend(workspace, _estimate_chunk_cost_usd(chunk))
+            yield chunk
+            if running_total >= DAILY_DEV_BUDGET_USD:
+                yield f"\n[budget circuit breaker: workspace '{workspace}' hit its ${DAILY_DEV_BUDGET_USD:.2f}/day development threshold — stream terminated]"
+                break
+    finally:
+        chunks.close()
+
+
 def stream_openai(api_key: str, model: str, prompt: str, system: Optional[str], max_tokens: int) -> Iterator[str]:
     """OpenAI caches prompts >=1024 tokens automatically; no request flag is needed,
     so the stable `system` block is simply placed ahead of the variable `prompt`."""
@@ -100,6 +141,7 @@ def stream_openai(api_key: str, model: str, prompt: str, system: Optional[str], 
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
+    stream = None
     try:
         stream = client.chat.completions.create(
             model=model,
@@ -113,6 +155,9 @@ def stream_openai(api_key: str, model: str, prompt: str, system: Optional[str], 
                 yield delta
     except OpenAIError as e:
         yield f"[openai upstream error: {str(e)}]"
+    finally:
+        if stream is not None:
+            stream.close()
 
 
 def stream_anthropic(api_key: str, model: str, prompt: str, system: Optional[str], max_tokens: int) -> Iterator[str]:
@@ -143,12 +188,18 @@ def stream_google(api_key: str, model: str, prompt: str, system: Optional[str], 
         system_instruction=system,
         max_output_tokens=max_tokens,
     )
+    response_stream = None
     try:
-        for chunk in client.models.generate_content_stream(model=model, contents=prompt, config=config):
+        response_stream = client.models.generate_content_stream(model=model, contents=prompt, config=config)
+        for chunk in response_stream:
             if chunk.text:
                 yield chunk.text
     except GoogleAPIError as e:
         yield f"[google upstream error: {str(e)}]"
+    finally:
+        close = getattr(response_stream, "close", None)
+        if callable(close):
+            close()
 
 
 PROVIDER_STREAMERS: dict[Provider, Callable[[str, str, str, Optional[str], int], Iterator[str]]] = {
@@ -173,12 +224,15 @@ async def proxy_chat(request: ProxyRequest):
     provider = detect_provider(request.model)
 
     # 3. Fetch and decrypt the wholesale tenant's provider key from the vault
-    api_key = get_tenant_provider_key("Acme Corp", provider)
+    workspace = "Acme Corp"
+    api_key = get_tenant_provider_key(workspace, provider)
 
-    # 4. Stream the live completion back to the caller using that provider's native caching strategy
+    # 4. Stream the live completion back to the caller using that provider's native caching strategy,
+    #    metered by the budget circuit breaker so a runaway prompt can't blow past the daily dev budget
     streamer = PROVIDER_STREAMERS[provider]
+    raw_stream = streamer(api_key, request.model, request.prompt, request.system, request.max_tokens)
     return StreamingResponse(
-        streamer(api_key, request.model, request.prompt, request.system, request.max_tokens),
+        budget_circuit_breaker(raw_stream, workspace),
         media_type="text/plain",
     )
 
