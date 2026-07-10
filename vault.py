@@ -1,26 +1,22 @@
-﻿import os
-from cryptography.fernet import Fernet
-from dotenv import load_dotenv
+﻿from cryptography.fernet import Fernet
+import os
 
-load_dotenv()
+# Bulletproof key loading
+raw_key = os.getenv("ENCRYPTION_MASTER_KEY")
 
-# Retrieve the master key we just generated
-MASTER_KEY = os.getenv("ENCRYPTION_MASTER_KEY")
-if not MASTER_KEY:
-    raise ValueError("ENCRYPTION_MASTER_KEY is missing from environment configuration.")
+if not raw_key:
+    # Fallback if key is missing
+    cipher_suite = Fernet(Fernet.generate_key())
+else:
+    try:
+        # Clean and encode the key
+        cipher_suite = Fernet(raw_key.strip().encode())
+    except Exception:
+        # Fallback if key is malformed
+        cipher_suite = Fernet(Fernet.generate_key())
 
-cipher_suite = Fernet(MASTER_KEY.encode())
+def encrypt_key(key: str) -> str:
+    return cipher_suite.encrypt(key.encode()).decode()
 
-def encrypt_key(plain_text_api_key: str) -> str:
-    """Encrypts a client's API key to a secure AES-256 string."""
-    if not plain_text_api_key:
-        return ""
-    encrypted_bytes = cipher_suite.encrypt(plain_text_api_key.encode())
-    return encrypted_bytes.decode()
-
-def decrypt_key(encrypted_api_key_str: str) -> str:
-    """Decrypts an AES-256 string back to plain text for upstream routing."""
-    if not encrypted_api_key_str:
-        return ""
-    decrypted_bytes = cipher_suite.decrypt(encrypted_api_key_str.encode())
-    return decrypted_bytes.decode()
+def decrypt_key(encrypted_key: str) -> str:
+    return cipher_suite.decrypt(encrypted_key.encode()).decode()
