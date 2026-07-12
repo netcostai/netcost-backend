@@ -1,255 +1,72 @@
 import os
-from datetime import date
-from typing import Callable, Iterator, Optional
-
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
-from dotenv import load_dotenv
-from supabase import create_client, Client
+from supabase import create_client
+from cryptography.fernet import Fernet
+from openai import OpenAI
 
-from anthropic import Anthropic
-from anthropic import APIError as AnthropicAPIError
-from google import genai
-from google.genai import types as genai_types
-from google.genai.errors import APIError as GoogleAPIError
-from openai import OpenAI, OpenAIError
+app = FastAPI()
 
-from vault import decrypt_key, encrypt_key
-from schemas import Provider, VaultVaultCreate, VaultVaultResponse
+# 1. Setup Security & Database
+# Ensure ENCRYPTION_MASTER_KEY, SUPABASE_URL, and SUPABASE_KEY 
+# are set in your Render "Environment" variables
+MASTER_KEY = os.environ.get("ENCRYPTION_MASTER_KEY")
+cipher_suite = Fernet(MASTER_KEY.encode())
 
-load_dotenv()
+supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
 
-app = FastAPI(title="NetCost Wholesale Token Gateway")
+# 2. Models
+class VaultEntry(BaseModel):
+    company_id: str
+    provider: str
+    raw_provider_key: str
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Initialize Supabase
-url: str = os.getenv("SUPABASE_URL")
-key: str = os.getenv("SUPABASE_KEY")
-if not url or not key:
-    raise ValueError("Supabase configuration variables are missing.")
-supabase: Client = create_client(url, key)
-
-# Domain-Locked Isolation Configuration
-BANNED_CONSUMER_DOMAINS = ["gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "icloud.com", "aol.com"]
-
-# Budget Circuit Breaker Configuration
-DAILY_DEV_BUDGET_USD = float(os.getenv("DAILY_DEV_BUDGET_USD", "5.00"))
-ESTIMATED_COST_PER_1K_TOKENS_USD = float(os.getenv("ESTIMATED_COST_PER_1K_TOKENS_USD", "0.03"))
-CHARS_PER_TOKEN_ESTIMATE = 4
-
-# In-memory (workspace, day) -> cumulative estimated spend in USD. Resets naturally
-# as the date key rolls over; not persisted, so a process restart also resets it.
-_workspace_daily_spend: dict[tuple[str, date], float] = {}
-
-# Model string prefix -> provider routing table
-MODEL_PREFIX_ROUTES: dict[str, Provider] = {
-    "claude-": "anthropic",
-    "gemini-": "google",
-    "gpt-": "openai",
-    "chatgpt-": "openai",
-    "o1": "openai",
-    "o3": "openai",
-    "o4": "openai",
-}
-
-
-class ProxyRequest(BaseModel):
-    model: str = "gpt-4o"
+class ChatRequest(BaseModel):
+    model: str
     prompt: str
-    system: Optional[str] = None  # stable instructions kept ahead of `prompt` to form the cacheable prefix
-    max_tokens: int = 1024
-    user_id: str  # Enterprise routing expects a business email identifier
+    max_tokens: int = 50
 
-
-@app.get("/")
-async def status():
-    return {"status": "online", "gateway": "NetCost Token Proxy"}
-
-
-def detect_provider(model: str) -> Provider:
-    """Maps an incoming model string to its owning provider."""
-    model_lower = model.lower()
-    for prefix, provider in MODEL_PREFIX_ROUTES.items():
-        if model_lower.startswith(prefix):
-            return provider
-    raise HTTPException(status_code=400, detail=f"Unrecognized model '{model}': no provider mapping found.")
-
-
-def get_tenant_provider_key(company_name: str, provider: Provider) -> str:
-    """Fetches the matching provider credential for a tenant from Supabase vault_credentials and decrypts it."""
-    response = (
-        supabase.table("vault_credentials")
-        .select("encrypted_provider_key")
-        .eq("company_name", company_name)
-        .eq("provider", provider)
-        .limit(1)
-        .execute()
-    )
-    if not response.data:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No vaulted '{provider}' credential found for tenant '{company_name}'.",
-        )
-    return decrypt_key(response.data[0]["encrypted_provider_key"])
-
-
-def _estimate_chunk_cost_usd(chunk: str) -> float:
-    """Rough token-cost estimate from raw character count; good enough to gate a budget, not to bill."""
-    estimated_tokens = max(1, len(chunk) / CHARS_PER_TOKEN_ESTIMATE)
-    return (estimated_tokens / 1000) * ESTIMATED_COST_PER_1K_TOKENS_USD
-
-
-def _record_spend(workspace: str, cost_usd: float) -> float:
-    """Adds cost_usd to today's ledger entry for workspace and returns the new running total."""
-    ledger_key = (workspace, date.today())
-    running_total = _workspace_daily_spend.get(ledger_key, 0.0) + cost_usd
-    _workspace_daily_spend[ledger_key] = running_total
-    return running_total
-
-
-def budget_circuit_breaker(chunks: Iterator[str], workspace: str) -> Iterator[str]:
-    """Meters every chunk against the workspace's daily dev budget. The instant the
-    running total crosses the threshold, breaks the loop and calls chunks.close(),
-    sending GeneratorExit into the upstream provider generator so its underlying
-    connection/socket is torn down immediately instead of continuing to stream
-    (and bill for) tokens the caller has already been cut off from."""
-    try:
-        for chunk in chunks:
-            running_total = _record_spend(workspace, _estimate_chunk_cost_usd(chunk))
-            yield chunk
-            if running_total >= DAILY_DEV_BUDGET_USD:
-                yield f"\n[budget circuit breaker: workspace '{workspace}' hit its ${DAILY_DEV_BUDGET_USD:.2f}/day development threshold — stream terminated]"
-                break
-    finally:
-        chunks.close()
-
-
-def stream_openai(api_key: str, model: str, prompt: str, system: Optional[str], max_tokens: int) -> Iterator[str]:
-    """OpenAI caches prompts >=1024 tokens automatically; no request flag is needed,
-    so the stable `system` block is simply placed ahead of the variable `prompt`."""
-    client = OpenAI(api_key=api_key)
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-    stream = None
-    try:
-        stream = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            stream=True,
-        )
-        for chunk in stream:
-            delta = chunk.choices[0].delta.content
-            if delta:
-                yield delta
-    except OpenAIError as e:
-        yield f"[openai upstream error: {str(e)}]"
-    finally:
-        if stream is not None:
-            stream.close()
-
-
-def stream_anthropic(api_key: str, model: str, prompt: str, system: Optional[str], max_tokens: int) -> Iterator[str]:
-    """Anthropic caching is explicit: the stable `system` block carries an
-    ephemeral cache_control breakpoint so repeat requests read it from cache."""
-    client = Anthropic(api_key=api_key)
-    kwargs = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    if system:
-        kwargs["system"] = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
-    try:
-        with client.messages.stream(**kwargs) as stream:
-            for text in stream.text_stream:
-                yield text
-    except AnthropicAPIError as e:
-        yield f"[anthropic upstream error: {str(e)}]"
-
-
-def stream_google(api_key: str, model: str, prompt: str, system: Optional[str], max_tokens: int) -> Iterator[str]:
-    """Gemini applies implicit prompt caching automatically on supported models;
-    keeping `system_instruction` ahead of the per-request prompt lets Google
-    detect and cache the shared prefix with no explicit cache object required."""
-    client = genai.Client(api_key=api_key)
-    config = genai_types.GenerateContentConfig(
-        system_instruction=system,
-        max_output_tokens=max_tokens,
-    )
-    response_stream = None
-    try:
-        response_stream = client.models.generate_content_stream(model=model, contents=prompt, config=config)
-        for chunk in response_stream:
-            if chunk.text:
-                yield chunk.text
-    except GoogleAPIError as e:
-        yield f"[google upstream error: {str(e)}]"
-    finally:
-        close = getattr(response_stream, "close", None)
-        if callable(close):
-            close()
-
-
-PROVIDER_STREAMERS: dict[Provider, Callable[[str, str, str, Optional[str], int], Iterator[str]]] = {
-    "openai": stream_openai,
-    "anthropic": stream_anthropic,
-    "google": stream_google,
-}
-
-
-@app.post("/v1/proxy/chat")
-async def proxy_chat(request: ProxyRequest):
-    # 1. Enforce Domain-Locked Isolation Guardrail
-    if "@" in request.user_id:
-        user_domain = request.user_id.split("@")[-1].lower().strip()
-        if user_domain in BANNED_CONSUMER_DOMAINS:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Access Denied: Domain '{user_domain}' is isolated from wholesale routing. Corporate credentials required."
-            )
-
-    # 2. Route to the correct provider based on the model string
-    provider = detect_provider(request.model)
-
-    # 3. Fetch and decrypt the wholesale tenant's provider key from the vault
-    workspace = "Acme Corp"
-    api_key = get_tenant_provider_key(workspace, provider)
-
-    # 4. Stream the live completion back to the caller using that provider's native caching strategy,
-    #    metered by the budget circuit breaker so a runaway prompt can't blow past the daily dev budget
-    streamer = PROVIDER_STREAMERS[provider]
-    raw_stream = streamer(api_key, request.model, request.prompt, request.system, request.max_tokens)
-    return StreamingResponse(
-        budget_circuit_breaker(raw_stream, workspace),
-        media_type="text/plain",
-    )
-
-
+# --- STORAGE ENDPOINT ---
+# Customers use this to store their key securely
 @app.post("/v1/vault/store")
-async def store_secure_credential(payload: VaultVaultCreate):
+async def store_key(entry: VaultEntry):
+    encrypted_key = cipher_suite.encrypt(entry.raw_provider_key.encode())
+    
+    supabase.table("vault_credentials").upsert({
+        "company_id": entry.company_id,
+        "provider": entry.provider,
+        "encrypted_provider_key": encrypted_key.decode()
+    }).execute()
+    
+    return {"status": "success", "message": f"Key secured for {entry.company_id}"}
+
+# --- PROXY ENDPOINT ---
+# Customers use this to send prompts. 
+# They MUST include their 'company_id' in the header.
+@app.post("/v1/proxy/chat")
+async def chat_proxy(request: ChatRequest, company_id: str = Header(...)):
+    # 1. Fetch key for THIS specific company
+    response = supabase.table("vault_credentials") \
+        .select("encrypted_provider_key") \
+        .eq("company_id", company_id) \
+        .execute()
+    
+    if not response.data:
+        raise HTTPException(status_code=404, detail="No API key found for this company.")
+
+    # 2. Decrypt the key on the fly
+    encrypted_key = response.data[0]['encrypted_provider_key'].encode()
+    decrypted_key = cipher_suite.decrypt(encrypted_key).decode()
+
+    # 3. Forward the request to AI using the customer's key
+    client = OpenAI(api_key=decrypted_key)
+    
     try:
-        scrambled_key = encrypt_key(payload.raw_provider_key)
-        db_row = {
-            "company_name": payload.company_name,
-            "provider": payload.provider,
-            "encrypted_provider_key": scrambled_key,
-        }
-        response = supabase.table("vault_credentials").insert(db_row).execute()
-        if response.data:
-            return response.data[0]
-        else:
-            raise HTTPException(status_code=500, detail="Database write confirmed but record payload empty.")
+        ai_response = client.chat.completions.create(
+            model=request.model,
+            messages=[{"role": "user", "content": request.prompt}],
+            max_tokens=request.max_tokens
+        )
+        return {"response": ai_response.choices[0].message.content}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database pipeline failure: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"AI Provider Error: {str(e)}")
