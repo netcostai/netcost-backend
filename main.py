@@ -7,66 +7,50 @@ from openai import OpenAI
 
 app = FastAPI()
 
-# 1. Setup Security & Database
-# Ensure ENCRYPTION_MASTER_KEY, SUPABASE_URL, and SUPABASE_KEY 
-# are set in your Render "Environment" variables
+# Configuration
 MASTER_KEY = os.environ.get("ENCRYPTION_MASTER_KEY")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+# Safety Check: Did we get our keys?
+if not MASTER_KEY or not SUPABASE_URL or not SUPABASE_KEY:
+    print("CRITICAL: Missing Environment Variables!")
+
 cipher_suite = Fernet(MASTER_KEY.encode())
-
-supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
-
-# 2. Models
-class VaultEntry(BaseModel):
-    company_id: str
-    provider: str
-    raw_provider_key: str
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 class ChatRequest(BaseModel):
     model: str
     prompt: str
     max_tokens: int = 50
 
-# --- STORAGE ENDPOINT ---
-# Customers use this to store their key securely
-@app.post("/v1/vault/store")
-async def store_key(entry: VaultEntry):
-    encrypted_key = cipher_suite.encrypt(entry.raw_provider_key.encode())
-    
-    supabase.table("vault_credentials").upsert({
-        "company_id": entry.company_id,
-        "provider": entry.provider,
-        "encrypted_provider_key": encrypted_key.decode()
-    }).execute()
-    
-    return {"status": "success", "message": f"Key secured for {entry.company_id}"}
-
-# --- PROXY ENDPOINT ---
-# Customers use this to send prompts. 
-# They MUST include their 'company_id' in the header.
 @app.post("/v1/proxy/chat")
 async def chat_proxy(request: ChatRequest, company_id: str = Header(..., alias="company-id")):
-    # 1. Fetch key for THIS specific company
-    response = supabase.table("vault_credentials") \
-        .select("encrypted_provider_key") \
-        .eq("company_id", company_id) \
-        .execute()
-    
-    if not response.data:
-        raise HTTPException(status_code=404, detail="No API key found for this company.")
-
-    # 2. Decrypt the key on the fly
-    encrypted_key = response.data[0]['encrypted_provider_key'].encode()
-    decrypted_key = cipher_suite.decrypt(encrypted_key).decode()
-
-    # 3. Forward the request to AI using the customer's key
-    client = OpenAI(api_key=decrypted_key)
+    print(f"DEBUG: Processing request for company: {company_id}")
     
     try:
-        ai_response = client.chat.completions.create(
+        # 1. Fetch
+        response = supabase.table("vault_credentials").select("encrypted_provider_key").eq("company_id", company_id).execute()
+        
+        if not response.data:
+            print("DEBUG: No key found in database")
+            raise HTTPException(status_code=404, detail="No key found")
+            
+        encrypted_val = response.data[0]['encrypted_provider_key']
+        print("DEBUG: Database fetch successful")
+        
+        # 2. Decrypt
+        decrypted_key = cipher_suite.decrypt(encrypted_val.encode()).decode()
+        print("DEBUG: Decryption successful")
+
+        # 3. Call OpenAI
+        client = OpenAI(api_key=decrypted_key)
+        response = client.chat.completions.create(
             model=request.model,
-            messages=[{"role": "user", "content": request.prompt}],
-            max_tokens=request.max_tokens
+            messages=[{"role": "user", "content": request.prompt}]
         )
-        return {"response": ai_response.choices[0].message.content}
+        return {"response": response.choices[0].message.content}
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI Provider Error: {str(e)}")
+        print(f"DEBUG: Error happened: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
