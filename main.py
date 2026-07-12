@@ -44,7 +44,7 @@ async def store_key(entry: VaultEntry):
 # Customers use this to send prompts. 
 # They MUST include their 'company_id' in the header.
 @app.post("/v1/proxy/chat")
-async def chat_proxy(request: ChatRequest, company_id: str = Header(...)):
+async def chat_proxy(request: ChatRequest, company_id: str = Header(..., alias="company-id")):
     # 1. Fetch key for THIS specific company
     response = supabase.table("vault_credentials") \
         .select("encrypted_provider_key") \
