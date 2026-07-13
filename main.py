@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -69,6 +69,7 @@ def get_company_for_user(user_id: str) -> dict:
         "invite_code": row["companies"]["invite_code"],
         "role": row["role"],
         "status": row["status"],
+        "user_id": user_id,
     }
 
 
@@ -85,34 +86,45 @@ def require_admin(company: dict = Depends(require_active)) -> dict:
     return company
 
 
-def call_openai(api_key: str, model: str, prompt: str, max_tokens: int) -> str:
+def call_openai(api_key: str, model: str, prompt: str, max_tokens: int):
     client = OpenAI(api_key=api_key)
     completion = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens,
     )
-    return completion.choices[0].message.content
+    text = completion.choices[0].message.content
+    usage = completion.usage
+    input_tokens = usage.prompt_tokens if usage else None
+    output_tokens = usage.completion_tokens if usage else None
+    return text, input_tokens, output_tokens
 
 
-def call_anthropic(api_key: str, model: str, prompt: str, max_tokens: int) -> str:
+def call_anthropic(api_key: str, model: str, prompt: str, max_tokens: int):
     client = Anthropic(api_key=api_key)
     message = client.messages.create(
         model=model,
         max_tokens=max_tokens,
         messages=[{"role": "user", "content": prompt}],
     )
-    return message.content[0].text
+    text = message.content[0].text
+    input_tokens = message.usage.input_tokens if message.usage else None
+    output_tokens = message.usage.output_tokens if message.usage else None
+    return text, input_tokens, output_tokens
 
 
-def call_google(api_key: str, model: str, prompt: str, max_tokens: int) -> str:
+def call_google(api_key: str, model: str, prompt: str, max_tokens: int):
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
         model=model,
         contents=prompt,
         config=genai_types.GenerateContentConfig(max_output_tokens=max_tokens),
     )
-    return response.text
+    text = response.text
+    usage = response.usage_metadata
+    input_tokens = usage.prompt_token_count if usage else None
+    output_tokens = usage.candidates_token_count if usage else None
+    return text, input_tokens, output_tokens
 
 
 PROVIDER_HANDLERS = {
@@ -120,6 +132,22 @@ PROVIDER_HANDLERS = {
     "anthropic": call_anthropic,
     "google": call_google,
 }
+
+
+def log_usage(company_id: str, user_id: str, provider: str, model: str, input_tokens, output_tokens):
+    try:
+        supabase.table("usage_logs").insert({
+            "company_id": company_id,
+            "user_id": user_id,
+            "provider": provider,
+            "model": model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }).execute()
+    except Exception:
+        # Usage logging is best-effort — a logging failure should never
+        # break the actual chat response the user is waiting on.
+        pass
 
 
 @app.post("/v1/auth/complete-signup")
@@ -281,7 +309,42 @@ async def chat_proxy(request: ChatRequest, company: dict = Depends(require_activ
     model = request.model or DEFAULT_MODELS[request.provider]
 
     try:
-        text = handler(decrypted_key, model, request.prompt, request.max_tokens)
-        return {"response": text}
+        text, input_tokens, output_tokens = handler(decrypted_key, model, request.prompt, request.max_tokens)
     except Exception:
         raise HTTPException(status_code=500, detail="Provider request failed")
+
+    log_usage(company["company_id"], company["user_id"], request.provider, model, input_tokens, output_tokens)
+
+    return {"response": text}
+
+
+@app.get("/v1/usage/summary")
+async def usage_summary(company: dict = Depends(require_admin)):
+    result = (
+        supabase.table("usage_logs")
+        .select("user_id, provider, input_tokens, output_tokens")
+        .eq("company_id", company["company_id"])
+        .execute()
+    )
+
+    by_user: dict = {}
+    for row in result.data:
+        uid = row["user_id"]
+        if uid not in by_user:
+            by_user[uid] = {"requests": 0, "input_tokens": 0, "output_tokens": 0}
+        by_user[uid]["requests"] += 1
+        by_user[uid]["input_tokens"] += row["input_tokens"] or 0
+        by_user[uid]["output_tokens"] += row["output_tokens"] or 0
+
+    usage = []
+    for uid, stats in by_user.items():
+        try:
+            user = supabase.auth.admin.get_user_by_id(uid)
+            email = user.user.email if user and user.user else "Unknown"
+        except Exception:
+            email = "Unknown"
+        usage.append({"user_id": uid, "email": email, **stats})
+
+    usage.sort(key=lambda u: u["input_tokens"] + u["output_tokens"], reverse=True)
+
+    return {"usage": usage}
