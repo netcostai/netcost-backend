@@ -45,20 +45,44 @@ class ChatRequest(BaseModel):
 
 
 class CompleteSignupRequest(BaseModel):
-    company_name: str
+    company_name: Optional[str] = None
+    invite_code: Optional[str] = None
+
+
+class TeamActionRequest(BaseModel):
+    user_id: str
 
 
 def get_company_for_user(user_id: str) -> dict:
     result = (
         supabase.table("company_users")
-        .select("company_id, companies(name)")
+        .select("company_id, role, status, companies(name, invite_code)")
         .eq("user_id", user_id)
         .execute()
     )
     if not result.data:
         raise HTTPException(status_code=404, detail="No company linked to this account")
     row = result.data[0]
-    return {"company_id": row["company_id"], "company_name": row["companies"]["name"]}
+    return {
+        "company_id": row["company_id"],
+        "company_name": row["companies"]["name"],
+        "invite_code": row["companies"]["invite_code"],
+        "role": row["role"],
+        "status": row["status"],
+    }
+
+
+def require_active(user_id: str = Depends(get_current_user_id)) -> dict:
+    company = get_company_for_user(user_id)
+    if company["status"] != "active":
+        raise HTTPException(status_code=403, detail="Your account is pending admin approval")
+    return company
+
+
+def require_admin(company: dict = Depends(require_active)) -> dict:
+    if company["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only company admins can do this")
+    return company
 
 
 def call_openai(api_key: str, model: str, prompt: str, max_tokens: int) -> str:
@@ -104,25 +128,88 @@ async def complete_signup(request: CompleteSignupRequest, user_id: str = Depends
     if existing.data:
         return {"company_id": existing.data[0]["company_id"]}
 
+    if request.invite_code:
+        company_result = supabase.table("companies").select("id").eq("invite_code", request.invite_code).execute()
+        if not company_result.data:
+            raise HTTPException(status_code=404, detail="Invalid invite code")
+        company_id = company_result.data[0]["id"]
+        supabase.table("company_users").insert(
+            {"user_id": user_id, "company_id": company_id, "role": "member", "status": "pending"}
+        ).execute()
+        return {"company_id": company_id, "status": "pending"}
+
+    if not request.company_name:
+        raise HTTPException(status_code=400, detail="Company name is required to create a new company")
+
     company_result = supabase.table("companies").insert({"name": request.company_name}).execute()
     if not company_result.data:
         raise HTTPException(status_code=500, detail="Failed to create company")
 
     company_id = company_result.data[0]["id"]
-    supabase.table("company_users").insert({"user_id": user_id, "company_id": company_id}).execute()
+    supabase.table("company_users").insert(
+        {"user_id": user_id, "company_id": company_id, "role": "admin", "status": "active"}
+    ).execute()
 
-    return {"company_id": company_id}
+    return {"company_id": company_id, "status": "active"}
 
 
 @app.get("/v1/me")
 async def get_me(user_id: str = Depends(get_current_user_id)):
-    company = get_company_for_user(user_id)
-    return company
+    return get_company_for_user(user_id)
+
+
+@app.get("/v1/team/pending")
+async def list_pending(company: dict = Depends(require_admin)):
+    result = (
+        supabase.table("company_users")
+        .select("user_id")
+        .eq("company_id", company["company_id"])
+        .eq("status", "pending")
+        .execute()
+    )
+
+    pending = []
+    for row in result.data:
+        try:
+            user = supabase.auth.admin.get_user_by_id(row["user_id"])
+            email = user.user.email if user and user.user else "Unknown"
+        except Exception:
+            email = "Unknown"
+        pending.append({"user_id": row["user_id"], "email": email})
+
+    return {"pending": pending}
+
+
+@app.post("/v1/team/approve")
+async def approve_member(request: TeamActionRequest, company: dict = Depends(require_admin)):
+    result = (
+        supabase.table("company_users")
+        .update({"status": "active"})
+        .eq("user_id", request.user_id)
+        .eq("company_id", company["company_id"])
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="No pending request found for this user")
+    return {"status": "approved"}
+
+
+@app.post("/v1/team/deny")
+async def deny_member(request: TeamActionRequest, company: dict = Depends(require_admin)):
+    result = (
+        supabase.table("company_users")
+        .delete()
+        .eq("user_id", request.user_id)
+        .eq("company_id", company["company_id"])
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="No pending request found for this user")
+    return {"status": "denied"}
 
 
 @app.get("/v1/vault/status")
-async def vault_status(user_id: str = Depends(get_current_user_id)):
-    company = get_company_for_user(user_id)
+async def vault_status(company: dict = Depends(require_active)):
     result = (
         supabase.table("vault_credentials")
         .select("provider")
@@ -134,8 +221,7 @@ async def vault_status(user_id: str = Depends(get_current_user_id)):
 
 
 @app.post("/v1/vault/create", response_model=VaultEntryResponse)
-async def create_vault_entry(request: VaultEntryCreate, user_id: str = Depends(get_current_user_id)):
-    company = get_company_for_user(user_id)
+async def create_vault_entry(request: VaultEntryCreate, company: dict = Depends(require_admin)):
     encrypted_provider_key = encrypt_key(request.raw_provider_key)
 
     existing = (
@@ -171,9 +257,7 @@ async def create_vault_entry(request: VaultEntryCreate, user_id: str = Depends(g
 
 
 @app.post("/v1/proxy/chat")
-async def chat_proxy(request: ChatRequest, user_id: str = Depends(get_current_user_id)):
-    company = get_company_for_user(user_id)
-
+async def chat_proxy(request: ChatRequest, company: dict = Depends(require_active)):
     result = (
         supabase.table("vault_credentials")
         .select("encrypted_provider_key")
