@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI, Header, HTTPException, Depends
+from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -8,6 +8,7 @@ from openai import OpenAI
 from anthropic import Anthropic
 from google import genai
 from google.genai import types as genai_types
+import stripe
 
 from vault import encrypt_key, decrypt_key
 from schemas import VaultEntryCreate, VaultEntryResponse, Provider
@@ -29,6 +30,15 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("FATAL: Missing SUPABASE_URL or SUPABASE_KEY. Refusing to start.")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
+STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")  # added after Step 6
+
+if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
+    raise RuntimeError("FATAL: Missing Stripe configuration. Refusing to start.")
+
+stripe.api_key = STRIPE_SECRET_KEY
 
 DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
@@ -53,10 +63,18 @@ class TeamActionRequest(BaseModel):
     user_id: str
 
 
+def get_user_email(user_id: str) -> str:
+    try:
+        user = supabase.auth.admin.get_user_by_id(user_id)
+        return user.user.email if user and user.user else "Unknown"
+    except Exception:
+        return "Unknown"
+
+
 def get_company_for_user(user_id: str) -> dict:
     result = (
         supabase.table("company_users")
-        .select("company_id, role, status, companies(name, invite_code)")
+        .select("company_id, role, status, companies(name, invite_code, subscription_status)")
         .eq("user_id", user_id)
         .execute()
     )
@@ -67,6 +85,7 @@ def get_company_for_user(user_id: str) -> dict:
         "company_id": row["company_id"],
         "company_name": row["companies"]["name"],
         "invite_code": row["companies"]["invite_code"],
+        "subscription_status": row["companies"]["subscription_status"],
         "role": row["role"],
         "status": row["status"],
         "user_id": user_id,
@@ -83,6 +102,12 @@ def require_active(user_id: str = Depends(get_current_user_id)) -> dict:
 def require_admin(company: dict = Depends(require_active)) -> dict:
     if company["role"] != "admin":
         raise HTTPException(status_code=403, detail="Only company admins can do this")
+    return company
+
+
+def require_subscribed(company: dict = Depends(require_active)) -> dict:
+    if company["subscription_status"] not in ("trialing", "active"):
+        raise HTTPException(status_code=402, detail="Payment required to use the gateway")
     return company
 
 
@@ -145,8 +170,34 @@ def log_usage(company_id: str, user_id: str, provider: str, model: str, input_to
             "output_tokens": output_tokens,
         }).execute()
     except Exception:
-        # Usage logging is best-effort — a logging failure should never
-        # break the actual chat response the user is waiting on.
+        pass
+
+
+def sync_subscription_quantity(company_id: str):
+    result = supabase.table("companies").select("stripe_subscription_id").eq("id", company_id).execute()
+    if not result.data or not result.data[0]["stripe_subscription_id"]:
+        return
+
+    subscription_id = result.data[0]["stripe_subscription_id"]
+
+    members = (
+        supabase.table("company_users")
+        .select("user_id", count="exact")
+        .eq("company_id", company_id)
+        .eq("status", "active")
+        .execute()
+    )
+    quantity = members.count or 1
+
+    try:
+        subscription = stripe.Subscription.retrieve(subscription_id)
+        item_id = subscription["items"]["data"][0]["id"]
+        stripe.Subscription.modify(
+            subscription_id,
+            items=[{"id": item_id, "quantity": quantity}],
+            proration_behavior="create_prorations",
+        )
+    except Exception:
         pass
 
 
@@ -195,16 +246,7 @@ async def list_pending(company: dict = Depends(require_admin)):
         .eq("status", "pending")
         .execute()
     )
-
-    pending = []
-    for row in result.data:
-        try:
-            user = supabase.auth.admin.get_user_by_id(row["user_id"])
-            email = user.user.email if user and user.user else "Unknown"
-        except Exception:
-            email = "Unknown"
-        pending.append({"user_id": row["user_id"], "email": email})
-
+    pending = [{"user_id": row["user_id"], "email": get_user_email(row["user_id"])} for row in result.data]
     return {"pending": pending}
 
 
@@ -219,6 +261,9 @@ async def approve_member(request: TeamActionRequest, company: dict = Depends(req
     )
     if not result.data:
         raise HTTPException(status_code=404, detail="No pending request found for this user")
+
+    sync_subscription_quantity(company["company_id"])
+
     return {"status": "approved"}
 
 
@@ -285,7 +330,7 @@ async def create_vault_entry(request: VaultEntryCreate, company: dict = Depends(
 
 
 @app.post("/v1/proxy/chat")
-async def chat_proxy(request: ChatRequest, company: dict = Depends(require_active)):
+async def chat_proxy(request: ChatRequest, company: dict = Depends(require_subscribed)):
     result = (
         supabase.table("vault_credentials")
         .select("encrypted_provider_key")
@@ -336,15 +381,94 @@ async def usage_summary(company: dict = Depends(require_admin)):
         by_user[uid]["input_tokens"] += row["input_tokens"] or 0
         by_user[uid]["output_tokens"] += row["output_tokens"] or 0
 
-    usage = []
-    for uid, stats in by_user.items():
-        try:
-            user = supabase.auth.admin.get_user_by_id(uid)
-            email = user.user.email if user and user.user else "Unknown"
-        except Exception:
-            email = "Unknown"
-        usage.append({"user_id": uid, "email": email, **stats})
-
+    usage = [{"user_id": uid, "email": get_user_email(uid), **stats} for uid, stats in by_user.items()]
     usage.sort(key=lambda u: u["input_tokens"] + u["output_tokens"], reverse=True)
 
     return {"usage": usage}
+
+
+@app.post("/v1/billing/create-checkout-session")
+async def create_checkout_session(company: dict = Depends(require_admin)):
+    members = (
+        supabase.table("company_users")
+        .select("user_id", count="exact")
+        .eq("company_id", company["company_id"])
+        .eq("status", "active")
+        .execute()
+    )
+    quantity = members.count or 1
+
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": STRIPE_PRICE_ID, "quantity": quantity}],
+            subscription_data={
+                "trial_period_days": 14,
+                "metadata": {"company_id": company["company_id"]},
+            },
+            client_reference_id=company["company_id"],
+            customer_email=get_user_email(company["user_id"]),
+            success_url="https://netcost.ai/gateway?billing=success",
+            cancel_url="https://netcost.ai/billing/setup?billing=cancelled",
+        )
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to start checkout")
+
+    return {"url": session.url}
+
+
+@app.post("/v1/billing/portal")
+async def billing_portal(company: dict = Depends(require_admin)):
+    result = supabase.table("companies").select("stripe_customer_id").eq("id", company["company_id"]).execute()
+    if not result.data or not result.data[0]["stripe_customer_id"]:
+        raise HTTPException(status_code=400, detail="No billing account found")
+
+    try:
+        session = stripe.billing_portal.Session.create(
+            customer=result.data[0]["stripe_customer_id"],
+            return_url="https://netcost.ai/gateway",
+        )
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to open billing portal")
+
+    return {"url": session.url}
+
+
+@app.post("/v1/billing/webhook")
+async def stripe_webhook(request: Request, stripe_signature: str = Header(None, alias="stripe-signature")):
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="Webhook not configured yet")
+
+    payload = await request.body()
+
+    try:
+        event = stripe.Webhook.construct_event(payload, stripe_signature, STRIPE_WEBHOOK_SECRET)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
+
+    event_type = event["type"]
+    data = event["data"]["object"]
+
+    if event_type == "checkout.session.completed":
+        company_id = data.get("client_reference_id")
+        if company_id:
+            supabase.table("companies").update({
+                "stripe_customer_id": data.get("customer"),
+                "stripe_subscription_id": data.get("subscription"),
+                "subscription_status": "trialing",
+            }).eq("id", company_id).execute()
+
+    elif event_type in ("customer.subscription.updated", "customer.subscription.created"):
+        subscription_id = data.get("id")
+        status = data.get("status")
+        supabase.table("companies").update({"subscription_status": status}).eq(
+            "stripe_subscription_id", subscription_id
+        ).execute()
+
+    elif event_type == "customer.subscription.deleted":
+        subscription_id = data.get("id")
+        supabase.table("companies").update({"subscription_status": "canceled"}).eq(
+            "stripe_subscription_id", subscription_id
+        ).execute()
+
+    return {"received": True}
