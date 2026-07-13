@@ -1,56 +1,97 @@
 import os
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client
-from cryptography.fernet import Fernet
 from openai import OpenAI
+
+from vault import encrypt_key, decrypt_key, generate_api_key, hash_api_key
+from schemas import VaultVaultCreate, VaultCreateResponse
 
 app = FastAPI()
 
-# Configuration
-MASTER_KEY = os.environ.get("ENCRYPTION_MASTER_KEY")
+# CORS — restrict this to your actual portal domain before going live
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://your-portal-domain.com"],
+    allow_methods=["POST"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-# Safety Check: Did we get our keys?
-if not MASTER_KEY or not SUPABASE_URL or not SUPABASE_KEY:
-    print("CRITICAL: Missing Environment Variables!")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("FATAL: Missing SUPABASE_URL or SUPABASE_KEY. Refusing to start.")
 
-cipher_suite = Fernet(MASTER_KEY.encode())
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 
 class ChatRequest(BaseModel):
     model: str
     prompt: str
     max_tokens: int = 50
 
+
+@app.post("/v1/vault/create", response_model=VaultCreateResponse)
+async def create_vault_entry(request: VaultVaultCreate):
+    """Onboard a new company: encrypt + store their provider key,
+    and issue a CostAI gateway API key (shown once, stored only as a hash)."""
+    api_key = generate_api_key()
+    api_key_hash = hash_api_key(api_key)
+    encrypted_provider_key = encrypt_key(request.raw_provider_key)
+
+    result = supabase.table("vault_credentials").insert({
+        "company_name": request.company_name,
+        "provider": request.provider,
+        "encrypted_provider_key": encrypted_provider_key,
+        "api_key_hash": api_key_hash,
+    }).execute()
+
+    if not result.data:
+        raise HTTPException(status_code=500, detail="Failed to create vault entry")
+
+    row = result.data[0]
+    return VaultCreateResponse(
+        id=row["id"],
+        company_name=row["company_name"],
+        provider=row["provider"],
+        api_key=api_key,
+        created_at=row["created_at"],
+    )
+
+
 @app.post("/v1/proxy/chat")
-async def chat_proxy(request: ChatRequest, company_id: str = Header(..., alias="company-id")):
-    print(f"DEBUG: Processing request for company: {company_id}")
-    
+async def chat_proxy(request: ChatRequest, authorization: str = Header(...)):
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
+
+    api_key = authorization.removeprefix("Bearer ").strip()
+    api_key_hash = hash_api_key(api_key)
+
+    result = (
+        supabase.table("vault_credentials")
+        .select("id, provider, encrypted_provider_key")
+        .eq("api_key_hash", api_key_hash)
+        .execute()
+    )
+
+    if not result.data:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    record = result.data[0]
+
     try:
-        # 1. Fetch
-        response = supabase.table("vault_credentials").select("encrypted_provider_key").eq("company_id", company_id).execute()
-        
-        if not response.data:
-            print("DEBUG: No key found in database")
-            raise HTTPException(status_code=404, detail="No key found")
-            
-        encrypted_val = response.data[0]['encrypted_provider_key']
-        print("DEBUG: Database fetch successful")
-        
-        # 2. Decrypt
-        decrypted_key = cipher_suite.decrypt(encrypted_val.encode()).decode()
-        print("DEBUG: Decryption successful")
+        decrypted_key = decrypt_key(record["encrypted_provider_key"])
+    except Exception:
+        raise HTTPException(status_code=500, detail="Unable to process request")
 
-        # 3. Call OpenAI
+    try:
         client = OpenAI(api_key=decrypted_key)
-        response = client.chat.completions.create(
+        completion = client.chat.completions.create(
             model=request.model,
-            messages=[{"role": "user", "content": request.prompt}]
+            messages=[{"role": "user", "content": request.prompt}],
         )
-        return {"response": response.choices[0].message.content}
-
-    except Exception as e:
-        print(f"DEBUG: Error happened: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"response": completion.choices[0].message.content}
+    except Exception:
+        raise HTTPException(status_code=500, detail="Provider request failed")
