@@ -29,9 +29,6 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Default model per provider, used unless the caller overrides it.
-# Verify these are still current model IDs before relying on them long-term —
-# providers deprecate/rename models over time.
 DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5-20251001",
@@ -88,4 +85,60 @@ async def create_vault_entry(request: VaultVaultCreate):
     api_key_hash = hash_api_key(api_key)
     encrypted_provider_key = encrypt_key(request.raw_provider_key)
 
-    result = supabase.table("vault_creden
+    result = supabase.table("vault_credentials").insert({
+        "company_name": request.company_name,
+        "provider": request.provider,
+        "encrypted_provider_key": encrypted_provider_key,
+        "api_key_hash": api_key_hash,
+    }).execute()
+
+    if not result.data:
+        raise HTTPException(status_code=500, detail="Failed to create vault entry")
+
+    row = result.data[0]
+    return VaultCreateResponse(
+        id=row["id"],
+        company_name=row["company_name"],
+        provider=row["provider"],
+        api_key=api_key,
+        created_at=row["created_at"],
+    )
+
+
+@app.post("/v1/proxy/chat")
+async def chat_proxy(request: ChatRequest, authorization: str = Header(...)):
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
+
+    api_key = authorization.removeprefix("Bearer ").strip()
+    api_key_hash = hash_api_key(api_key)
+
+    result = (
+        supabase.table("vault_credentials")
+        .select("id, provider, encrypted_provider_key")
+        .eq("api_key_hash", api_key_hash)
+        .execute()
+    )
+
+    if not result.data:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    record = result.data[0]
+    provider = record["provider"]
+
+    handler = PROVIDER_HANDLERS.get(provider)
+    if not handler:
+        raise HTTPException(status_code=500, detail=f"Unsupported provider: {provider}")
+
+    try:
+        decrypted_key = decrypt_key(record["encrypted_provider_key"])
+    except Exception:
+        raise HTTPException(status_code=500, detail="Unable to process request")
+
+    model = request.model or DEFAULT_MODELS[provider]
+
+    try:
+        text = handler(decrypted_key, model, request.prompt, request.max_tokens)
+        return {"response": text}
+    except Exception:
+        raise HTTPException(status_code=500, detail="Provider request failed")
