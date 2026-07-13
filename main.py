@@ -16,7 +16,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://your-portal-domain.com"],
+    allow_origins=["https://netcost.ai", "https://www.netcost.ai"],
     allow_methods=["POST"],
     allow_headers=["Authorization", "Content-Type"],
 )
