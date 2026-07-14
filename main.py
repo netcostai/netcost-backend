@@ -33,7 +33,7 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
 STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID")
-STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")  # added after Step 6
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 
 if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
     raise RuntimeError("FATAL: Missing Stripe configuration. Refusing to start.")
@@ -450,25 +450,27 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None, 
     data = event["data"]["object"]
 
     if event_type == "checkout.session.completed":
-        company_id = data.get("client_reference_id")
+        company_id = getattr(data, "client_reference_id", None)
         if company_id:
             supabase.table("companies").update({
-                "stripe_customer_id": data.get("customer"),
-                "stripe_subscription_id": data.get("subscription"),
+                "stripe_customer_id": getattr(data, "customer", None),
+                "stripe_subscription_id": getattr(data, "subscription", None),
                 "subscription_status": "trialing",
             }).eq("id", company_id).execute()
 
     elif event_type in ("customer.subscription.updated", "customer.subscription.created"):
-        subscription_id = data.get("id")
-        status = data.get("status")
-        supabase.table("companies").update({"subscription_status": status}).eq(
-            "stripe_subscription_id", subscription_id
-        ).execute()
+        subscription_id = getattr(data, "id", None)
+        status = getattr(data, "status", None)
+        if subscription_id:
+            supabase.table("companies").update({"subscription_status": status}).eq(
+                "stripe_subscription_id", subscription_id
+            ).execute()
 
     elif event_type == "customer.subscription.deleted":
-        subscription_id = data.get("id")
-        supabase.table("companies").update({"subscription_status": "canceled"}).eq(
-            "stripe_subscription_id", subscription_id
-        ).execute()
+        subscription_id = getattr(data, "id", None)
+        if subscription_id:
+            supabase.table("companies").update({"subscription_status": "canceled"}).eq(
+                "stripe_subscription_id", subscription_id
+            ).execute()
 
     return {"received": True}
