@@ -1,4 +1,8 @@
 import os
+import time
+import threading
+from collections import defaultdict, deque
+from datetime import datetime, timezone
 from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -19,7 +23,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://netcost.ai", "https://www.netcost.ai"],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PATCH"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -46,6 +50,52 @@ DEFAULT_MODELS = {
     "google": "gemini-2.5-flash",
 }
 
+# --- Burst rate limiting (protects against runaway loops/bugs) ---
+# In-memory, per-process. Fine for a single Render instance; if this ever
+# scales to multiple instances, this needs to move to a shared store (e.g. Redis).
+RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_MAX_REQUESTS = 20
+
+_rate_limit_lock = threading.Lock()
+_rate_limit_buckets: dict = defaultdict(deque)
+
+
+def check_rate_limit(user_id: str):
+    now = time.time()
+    with _rate_limit_lock:
+        bucket = _rate_limit_buckets[user_id]
+        while bucket and now - bucket[0] > RATE_LIMIT_WINDOW_SECONDS:
+            bucket.popleft()
+        if len(bucket) >= RATE_LIMIT_MAX_REQUESTS:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many requests. Please wait a minute and try again.",
+            )
+        bucket.append(now)
+
+
+def get_daily_request_count(company_id: str) -> int:
+    today_start = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+    result = (
+        supabase.table("usage_logs")
+        .select("id", count="exact")
+        .eq("company_id", company_id)
+        .gte("created_at", today_start)
+        .execute()
+    )
+    return result.count or 0
+
+
+def check_daily_limit(company_id: str, limit: int):
+    count = get_daily_request_count(company_id)
+    if count >= limit:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Daily request limit of {limit} reached for your company. This resets at midnight UTC.",
+        )
+
 
 class ChatRequest(BaseModel):
     provider: Provider
@@ -63,6 +113,10 @@ class TeamActionRequest(BaseModel):
     user_id: str
 
 
+class CompanySettingsUpdate(BaseModel):
+    daily_request_limit: int
+
+
 def get_user_email(user_id: str) -> str:
     try:
         user = supabase.auth.admin.get_user_by_id(user_id)
@@ -74,7 +128,7 @@ def get_user_email(user_id: str) -> str:
 def get_company_for_user(user_id: str) -> dict:
     result = (
         supabase.table("company_users")
-        .select("company_id, role, status, companies(name, invite_code, subscription_status)")
+        .select("company_id, role, status, companies(name, invite_code, subscription_status, daily_request_limit)")
         .eq("user_id", user_id)
         .execute()
     )
@@ -86,6 +140,7 @@ def get_company_for_user(user_id: str) -> dict:
         "company_name": row["companies"]["name"],
         "invite_code": row["companies"]["invite_code"],
         "subscription_status": row["companies"]["subscription_status"],
+        "daily_request_limit": row["companies"]["daily_request_limit"],
         "role": row["role"],
         "status": row["status"],
         "user_id": user_id,
@@ -329,8 +384,36 @@ async def create_vault_entry(request: VaultEntryCreate, company: dict = Depends(
     return VaultEntryResponse(id=row["id"], provider=row["provider"], created_at=row["created_at"])
 
 
+@app.get("/v1/company/settings")
+async def get_company_settings(company: dict = Depends(require_admin)):
+    return {"daily_request_limit": company["daily_request_limit"]}
+
+
+@app.patch("/v1/company/settings")
+async def update_company_settings(request: CompanySettingsUpdate, company: dict = Depends(require_admin)):
+    if request.daily_request_limit < 1:
+        raise HTTPException(status_code=400, detail="Daily request limit must be at least 1")
+
+    supabase.table("companies").update(
+        {"daily_request_limit": request.daily_request_limit}
+    ).eq("id", company["company_id"]).execute()
+
+    return {"daily_request_limit": request.daily_request_limit}
+
+
+@app.get("/v1/usage/today")
+async def usage_today(company: dict = Depends(require_admin)):
+    return {
+        "requests_today": get_daily_request_count(company["company_id"]),
+        "daily_request_limit": company["daily_request_limit"],
+    }
+
+
 @app.post("/v1/proxy/chat")
 async def chat_proxy(request: ChatRequest, company: dict = Depends(require_subscribed)):
+    check_rate_limit(company["user_id"])
+    check_daily_limit(company["company_id"], company["daily_request_limit"])
+
     result = (
         supabase.table("vault_credentials")
         .select("encrypted_provider_key")
