@@ -99,7 +99,7 @@ class ChatRequest(BaseModel):
     provider: Provider
     prompt: str
     model: Optional[str] = None
-    max_tokens: int = 500
+    max_tokens: int = 2000
 
 
 class CompleteSignupRequest(BaseModel):
