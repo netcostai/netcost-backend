@@ -464,7 +464,15 @@ async def chat_proxy(request: ChatRequest, company: dict = Depends(require_subsc
                 usage_holder["output_tokens"],
             )
 
-    return StreamingResponse(generate(), media_type="text/plain")
+    return StreamingResponse(
+        generate(),
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.get("/v1/usage/summary")
