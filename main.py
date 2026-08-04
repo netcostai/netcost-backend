@@ -98,7 +98,7 @@ class ChatRequest(BaseModel):
     provider: Provider
     prompt: str
     model: Optional[str] = None
-    max_tokens: int = 50
+    max_tokens: int = 500
 
 
 class CompleteSignupRequest(BaseModel):
@@ -195,7 +195,10 @@ def call_google(api_key: str, model: str, prompt: str, max_tokens: int):
     response = client.models.generate_content(
         model=model,
         contents=prompt,
-        config=genai_types.GenerateContentConfig(max_output_tokens=max_tokens),
+        config=genai_types.GenerateContentConfig(
+            max_output_tokens=max_tokens,
+            thinking_config=genai_types.ThinkingConfig(thinking_level="low"),
+        ),
     )
     text = response.text
     usage = response.usage_metadata
