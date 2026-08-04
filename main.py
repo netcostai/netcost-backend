@@ -1,592 +1,161 @@
-import os
-import time
-import threading
-from collections import defaultdict, deque
-from datetime import datetime, timezone
-from fastapi import FastAPI, Header, HTTPException, Depends, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from typing import Optional
-from supabase import create_client
-from openai import OpenAI
-from anthropic import Anthropic
-from google import genai
-from google.genai import types as genai_types
-import stripe
-
-from vault import encrypt_key, decrypt_key
-from schemas import VaultEntryCreate, VaultEntryResponse, Provider
-from auth import get_current_user_id
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["https://netcost.ai", "https://www.netcost.ai"],
-    allow_methods=["GET", "POST", "PATCH"],
-    allow_headers=["Authorization", "Content-Type"],
-)
-
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("FATAL: Missing SUPABASE_URL or SUPABASE_KEY. Refusing to start.")
-
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
-STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID")
-STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
-
-if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
-    raise RuntimeError("FATAL: Missing Stripe configuration. Refusing to start.")
-
-stripe.api_key = STRIPE_SECRET_KEY
-
-DEFAULT_MODELS = {
-    "openai": "gpt-4o-mini",
-    "anthropic": "claude-haiku-4-5-20251001",
-    "google": "gemini-3.6-flash",
-}
-
-RATE_LIMIT_WINDOW_SECONDS = 60
-RATE_LIMIT_MAX_REQUESTS = 20
-
-_rate_limit_lock = threading.Lock()
-_rate_limit_buckets: dict = defaultdict(deque)
-
-
-def check_rate_limit(user_id: str):
-    now = time.time()
-    with _rate_limit_lock:
-        bucket = _rate_limit_buckets[user_id]
-        while bucket and now - bucket[0] > RATE_LIMIT_WINDOW_SECONDS:
-            bucket.popleft()
-        if len(bucket) >= RATE_LIMIT_MAX_REQUESTS:
-            raise HTTPException(
-                status_code=429,
-                detail="Too many requests. Please wait a minute and try again.",
-            )
-        bucket.append(now)
-
-
-def get_daily_request_count(company_id: str) -> int:
-    today_start = datetime.now(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    ).isoformat()
-    result = (
-        supabase.table("usage_logs")
-        .select("id", count="exact")
-        .eq("company_id", company_id)
-        .gte("created_at", today_start)
-        .execute()
-    )
-    return result.count or 0
-
-
-def check_daily_limit(company_id: str, limit: int):
-    count = get_daily_request_count(company_id)
-    if count >= limit:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Daily request limit of {limit} reached for your company. This resets at midnight UTC.",
-        )
-
-
-class ChatRequest(BaseModel):
-    provider: Provider
-    prompt: str
-    model: Optional[str] = None
-    max_tokens: int = 2000
-
-
-class CompleteSignupRequest(BaseModel):
-    company_name: Optional[str] = None
-    invite_code: Optional[str] = None
-
-
-class TeamActionRequest(BaseModel):
-    user_id: str
-
-
-class CompanySettingsUpdate(BaseModel):
-    daily_request_limit: int
-
-
-def get_user_email(user_id: str) -> str:
-    try:
-        user = supabase.auth.admin.get_user_by_id(user_id)
-        return user.user.email if user and user.user else "Unknown"
-    except Exception:
-        return "Unknown"
-
-
-def get_company_for_user(user_id: str) -> dict:
-    result = (
-        supabase.table("company_users")
-        .select("company_id, role, status, companies(name, invite_code, subscription_status, daily_request_limit)")
-        .eq("user_id", user_id)
-        .execute()
-    )
-    if not result.data:
-        raise HTTPException(status_code=404, detail="No company linked to this account")
-    row = result.data[0]
-    return {
-        "company_id": row["company_id"],
-        "company_name": row["companies"]["name"],
-        "invite_code": row["companies"]["invite_code"],
-        "subscription_status": row["companies"]["subscription_status"],
-        "daily_request_limit": row["companies"]["daily_request_limit"],
-        "role": row["role"],
-        "status": row["status"],
-        "user_id": user_id,
-    }
-
-
-def require_active(user_id: str = Depends(get_current_user_id)) -> dict:
-    company = get_company_for_user(user_id)
-    if company["status"] != "active":
-        raise HTTPException(status_code=403, detail="Your account is pending admin approval")
-    return company
-
-
-def require_admin(company: dict = Depends(require_active)) -> dict:
-    if company["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Only company admins can do this")
-    return company
-
-
-def require_subscribed(company: dict = Depends(require_active)) -> dict:
-    if company["subscription_status"] not in ("trialing", "active"):
-        raise HTTPException(status_code=402, detail="Payment required to use the gateway")
-    return company
-
-
-def stream_openai(api_key: str, model: str, prompt: str, max_tokens: int, usage_holder: dict):
-    client = OpenAI(api_key=api_key)
-    stream = client.responses.create(
-        model=model,
-        input=prompt,
-        max_output_tokens=max_tokens,
-        tools=[{"type": "web_search"}],
-        stream=True,
-    )
-    for event in stream:
-        if event.type == "response.output_text.delta":
-            yield event.delta
-        elif event.type == "response.completed":
-            usage = getattr(event.response, "usage", None)
-            usage_holder["input_tokens"] = getattr(usage, "input_tokens", None) if usage else None
-            usage_holder["output_tokens"] = getattr(usage, "output_tokens", None) if usage else None
-
-
-def stream_anthropic(api_key: str, model: str, prompt: str, max_tokens: int, usage_holder: dict):
-    client = Anthropic(api_key=api_key)
-    with client.messages.stream(
-        model=model,
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
-        tools=[{"type": "web_search_20260318", "name": "web_search"}],
-    ) as stream:
-        for text in stream.text_stream:
-            yield text
-        final_message = stream.get_final_message()
-        usage_holder["input_tokens"] = final_message.usage.input_tokens if final_message.usage else None
-        usage_holder["output_tokens"] = final_message.usage.output_tokens if final_message.usage else None
-
-
-def stream_google(api_key: str, model: str, prompt: str, max_tokens: int, usage_holder: dict):
-    client = genai.Client(api_key=api_key)
-    grounding_tool = genai_types.Tool(google_search=genai_types.GoogleSearch())
-    response_stream = client.models.generate_content_stream(
-        model=model,
-        contents=prompt,
-        config=genai_types.GenerateContentConfig(
-            max_output_tokens=max_tokens,
-            thinking_config=genai_types.ThinkingConfig(thinking_level="low"),
-            tools=[grounding_tool],
-        ),
-    )
-    for chunk in response_stream:
-        if chunk.text:
-            yield chunk.text
-        if chunk.usage_metadata:
-            usage_holder["input_tokens"] = chunk.usage_metadata.prompt_token_count
-            usage_holder["output_tokens"] = chunk.usage_metadata.candidates_token_count
-
-
-STREAM_HANDLERS = {
-    "openai": stream_openai,
-    "anthropic": stream_anthropic,
-    "google": stream_google,
-}
-
-
-def log_usage(company_id: str, user_id: str, provider: str, model: str, input_tokens, output_tokens):
-    try:
-        supabase.table("usage_logs").insert({
-            "company_id": company_id,
-            "user_id": user_id,
-            "provider": provider,
-            "model": model,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-        }).execute()
-    except Exception:
-        pass
-
-
-def sync_subscription_quantity(company_id: str):
-    result = supabase.table("companies").select("stripe_subscription_id").eq("id", company_id).execute()
-    if not result.data or not result.data[0]["stripe_subscription_id"]:
-        return
-
-    subscription_id = result.data[0]["stripe_subscription_id"]
-
-    members = (
-        supabase.table("company_users")
-        .select("user_id", count="exact")
-        .eq("company_id", company_id)
-        .eq("status", "active")
-        .execute()
-    )
-    quantity = members.count or 1
-
-    try:
-        subscription = stripe.Subscription.retrieve(subscription_id)
-        item_id = subscription["items"]["data"][0]["id"]
-        stripe.Subscription.modify(
-            subscription_id,
-            items=[{"id": item_id, "quantity": quantity}],
-            proration_behavior="create_prorations",
-        )
-    except Exception:
-        pass
-
-
-@app.post("/v1/auth/complete-signup")
-async def complete_signup(request: CompleteSignupRequest, user_id: str = Depends(get_current_user_id)):
-    existing = supabase.table("company_users").select("company_id").eq("user_id", user_id).execute()
-    if existing.data:
-        return {"company_id": existing.data[0]["company_id"]}
-
-    if request.invite_code:
-        company_result = supabase.table("companies").select("id").eq("invite_code", request.invite_code).execute()
-        if not company_result.data:
-            raise HTTPException(status_code=404, detail="Invalid invite code")
-        company_id = company_result.data[0]["id"]
-        supabase.table("company_users").insert(
-            {"user_id": user_id, "company_id": company_id, "role": "member", "status": "pending"}
-        ).execute()
-        return {"company_id": company_id, "status": "pending"}
-
-    if not request.company_name:
-        raise HTTPException(status_code=400, detail="Company name is required to create a new company")
-
-    company_result = supabase.table("companies").insert({"name": request.company_name}).execute()
-    if not company_result.data:
-        raise HTTPException(status_code=500, detail="Failed to create company")
-
-    company_id = company_result.data[0]["id"]
-    supabase.table("company_users").insert(
-        {"user_id": user_id, "company_id": company_id, "role": "admin", "status": "active"}
-    ).execute()
-
-    return {"company_id": company_id, "status": "active"}
-
-
-@app.get("/v1/me")
-async def get_me(user_id: str = Depends(get_current_user_id)):
-    return get_company_for_user(user_id)
-
-
-@app.get("/v1/team/pending")
-async def list_pending(company: dict = Depends(require_admin)):
-    result = (
-        supabase.table("company_users")
-        .select("user_id")
-        .eq("company_id", company["company_id"])
-        .eq("status", "pending")
-        .execute()
-    )
-    pending = [{"user_id": row["user_id"], "email": get_user_email(row["user_id"])} for row in result.data]
-    return {"pending": pending}
-
-
-@app.post("/v1/team/approve")
-async def approve_member(request: TeamActionRequest, company: dict = Depends(require_admin)):
-    result = (
-        supabase.table("company_users")
-        .update({"status": "active"})
-        .eq("user_id", request.user_id)
-        .eq("company_id", company["company_id"])
-        .execute()
-    )
-    if not result.data:
-        raise HTTPException(status_code=404, detail="No pending request found for this user")
-
-    sync_subscription_quantity(company["company_id"])
-
-    return {"status": "approved"}
-
-
-@app.post("/v1/team/deny")
-async def deny_member(request: TeamActionRequest, company: dict = Depends(require_admin)):
-    result = (
-        supabase.table("company_users")
-        .delete()
-        .eq("user_id", request.user_id)
-        .eq("company_id", company["company_id"])
-        .execute()
-    )
-    if not result.data:
-        raise HTTPException(status_code=404, detail="No pending request found for this user")
-    return {"status": "denied"}
-
-
-@app.get("/v1/vault/status")
-async def vault_status(company: dict = Depends(require_active)):
-    result = (
-        supabase.table("vault_credentials")
-        .select("provider")
-        .eq("company_id", company["company_id"])
-        .execute()
-    )
-    connected = [row["provider"] for row in result.data]
-    return {"connected_providers": connected}
-
-
-@app.post("/v1/vault/create", response_model=VaultEntryResponse)
-async def create_vault_entry(request: VaultEntryCreate, company: dict = Depends(require_admin)):
-    encrypted_provider_key = encrypt_key(request.raw_provider_key)
-
-    existing = (
-        supabase.table("vault_credentials")
-        .select("id")
-        .eq("company_id", company["company_id"])
-        .eq("provider", request.provider)
-        .execute()
-    )
-
-    payload = {
-        "company_id": company["company_id"],
-        "company_name": company["company_name"],
-        "provider": request.provider,
-        "encrypted_provider_key": encrypted_provider_key,
-    }
-
-    if existing.data:
-        result = (
-            supabase.table("vault_credentials")
-            .update(payload)
-            .eq("id", existing.data[0]["id"])
-            .execute()
-        )
-    else:
-        result = supabase.table("vault_credentials").insert(payload).execute()
-
-    if not result.data:
-        raise HTTPException(status_code=500, detail="Failed to save key")
-
-    row = result.data[0]
-    return VaultEntryResponse(id=row["id"], provider=row["provider"], created_at=row["created_at"])
-
-
-@app.get("/v1/company/settings")
-async def get_company_settings(company: dict = Depends(require_admin)):
-    return {"daily_request_limit": company["daily_request_limit"]}
-
-
-@app.patch("/v1/company/settings")
-async def update_company_settings(request: CompanySettingsUpdate, company: dict = Depends(require_admin)):
-    if request.daily_request_limit < 1:
-        raise HTTPException(status_code=400, detail="Daily request limit must be at least 1")
-
-    supabase.table("companies").update(
-        {"daily_request_limit": request.daily_request_limit}
-    ).eq("id", company["company_id"]).execute()
-
-    return {"daily_request_limit": request.daily_request_limit}
-
-
-@app.get("/v1/usage/today")
-async def usage_today(company: dict = Depends(require_admin)):
-    return {
-        "requests_today": get_daily_request_count(company["company_id"]),
-        "daily_request_limit": company["daily_request_limit"],
-    }
-
-
-@app.post("/v1/proxy/chat")
-async def chat_proxy(request: ChatRequest, company: dict = Depends(require_subscribed)):
-    check_rate_limit(company["user_id"])
-    check_daily_limit(company["company_id"], company["daily_request_limit"])
-
-    result = (
-        supabase.table("vault_credentials")
-        .select("encrypted_provider_key")
-        .eq("company_id", company["company_id"])
-        .eq("provider", request.provider)
-        .execute()
-    )
-
-    if not result.data:
-        raise HTTPException(status_code=404, detail=f"No {request.provider} key connected")
-
-    stream_handler = STREAM_HANDLERS.get(request.provider)
-    if not stream_handler:
-        raise HTTPException(status_code=500, detail=f"Unsupported provider: {request.provider}")
-
-    try:
-        decrypted_key = decrypt_key(result.data[0]["encrypted_provider_key"])
-    except Exception:
-        raise HTTPException(status_code=500, detail="Unable to process request")
-
-    model = request.model or DEFAULT_MODELS[request.provider]
-
-    def generate():
-        usage_holder = {"input_tokens": None, "output_tokens": None}
-        try:
-            for chunk in stream_handler(decrypted_key, model, request.prompt, request.max_tokens, usage_holder):
-                yield chunk
-        except Exception as e:
-            print(f"ERROR streaming {request.provider} ({model}): {type(e).__name__}: {e}")
-            yield "\n\n[This response was interrupted by an error.]"
-        finally:
-            log_usage(
-                company["company_id"],
-                company["user_id"],
-                request.provider,
-                model,
-                usage_holder["input_tokens"],
-                usage_holder["output_tokens"],
-            )
-
-    def sse_wrap():
-        for chunk in generate():
-            yield f"data: {chunk}\n\n"
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(
-        sse_wrap(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
+"use client";
+
+import { useState } from "react";
+import { useParams } from "next/navigation";
+import ReactMarkdown from "react-markdown";
+import { Navbar } from "@/components/navbar";
+import { PROVIDERS } from "@/lib/providers";
+import { useGatewayKeys } from "@/lib/gateway-context";
+import { supabase } from "@/lib/supabase-client";
+
+const API_URL = process.env.NEXT_PUBLIC_API_URL;
+
+export default function GatewayChatPage() {
+  const params = useParams<{ provider: string }>();
+  const { connectedProviders } = useGatewayKeys();
+  const provider = PROVIDERS.find((p) => p.id === params.provider);
+
+  const [prompt, setPrompt] = useState("");
+  const [response, setResponse] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  if (!provider) {
+    return (
+      <>
+        <Navbar />
+        <section className="max-w-2xl mx-auto px-4 py-20 text-center">
+          <p className="text-muted">Unknown provider.</p>
+        </section>
+      </>
+    );
+  }
+
+  const connected = connectedProviders.includes(provider.id);
+
+  if (!connected) {
+    return (
+      <>
+        <Navbar />
+        <section className="max-w-2xl mx-auto px-4 py-20 text-center">
+          <h1 className="text-2xl font-semibold mb-3">No key connected yet</h1>
+          <p className="text-muted mb-6">Add your {provider.displayName} key first from the gateway page.</p>
+          <a href="/gateway" className="text-primary hover:underline">
+            ← Back to Gateway
+          </a>
+        </section>
+      </>
+    );
+  }
+
+  async function handleSend() {
+    setLoading(true);
+    setError(null);
+    setResponse("");
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      if (!session) throw new Error("You must be signed in.");
+
+      const res = await fetch(`${API_URL}/v1/proxy/chat`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.access_token}`,
         },
-    )
+        body: JSON.stringify({ provider: provider.id, prompt }),
+      });
+      if (!res.ok) throw new Error("Request failed.");
+      const data = await res.json();
+      setResponse(data.response);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Something went wrong.");
+    } finally {
+      setLoading(false);
+    }
+  }
 
+  return (
+    <>
+      <Navbar />
+      <section className="max-w-2xl mx-auto px-4 sm:px-6 lg:px-8 py-16">
+        <div className="text-center mb-8">
+          <div className="inline-flex items-center gap-2 rounded-full border border-border bg-surface px-3 py-1 text-xs text-muted mb-4">
+            <span className="h-1.5 w-1.5 rounded-full bg-accent" />
+            Gateway — powered by {provider.displayName}
+          </div>
+          <h1 className="text-2xl font-semibold">Try your gateway</h1>
+        </div>
 
-@app.get("/v1/usage/summary")
-async def usage_summary(company: dict = Depends(require_admin)):
-    result = (
-        supabase.table("usage_logs")
-        .select("user_id, provider, input_tokens, output_tokens")
-        .eq("company_id", company["company_id"])
-        .execute()
-    )
+        <textarea
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+          placeholder="Ask something..."
+          rows={4}
+          disabled={loading}
+          className="w-full bg-surface border border-border rounded-lg p-4 mb-4 focus:outline-none focus:border-primary transition-colors disabled:opacity-60"
+        />
 
-    by_user: dict = {}
-    for row in result.data:
-        uid = row["user_id"]
-        if uid not in by_user:
-            by_user[uid] = {"requests": 0, "input_tokens": 0, "output_tokens": 0}
-        by_user[uid]["requests"] += 1
-        by_user[uid]["input_tokens"] += row["input_tokens"] or 0
-        by_user[uid]["output_tokens"] += row["output_tokens"] or 0
+        <button
+          onClick={handleSend}
+          disabled={loading || !prompt}
+          className="w-full bg-primary hover:bg-primary-hover text-white font-medium py-3 rounded-lg transition-colors disabled:opacity-70 mb-6 flex items-center justify-center gap-2"
+        >
+          {loading ? (
+            <>
+              <svg
+                className="animate-spin h-4 w-4 text-white"
+                xmlns="http://www.w3.org/2000/svg"
+                fill="none"
+                viewBox="0 0 24 24"
+              >
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path
+                  className="opacity-75"
+                  fill="currentColor"
+                  d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+                />
+              </svg>
+              Thinking...
+            </>
+          ) : (
+            "Send"
+          )}
+        </button>
 
-    usage = [{"user_id": uid, "email": get_user_email(uid), **stats} for uid, stats in by_user.items()]
-    usage.sort(key=lambda u: u["input_tokens"] + u["output_tokens"], reverse=True)
+        {error && <p className="text-sm text-red-400 mb-4">{error}</p>}
 
-    return {"usage": usage}
-
-
-@app.post("/v1/billing/create-checkout-session")
-async def create_checkout_session(company: dict = Depends(require_admin)):
-    members = (
-        supabase.table("company_users")
-        .select("user_id", count="exact")
-        .eq("company_id", company["company_id"])
-        .eq("status", "active")
-        .execute()
-    )
-    quantity = members.count or 1
-
-    try:
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            line_items=[{"price": STRIPE_PRICE_ID, "quantity": quantity}],
-            subscription_data={
-                "trial_period_days": 14,
-                "metadata": {"company_id": company["company_id"]},
-            },
-            client_reference_id=company["company_id"],
-            customer_email=get_user_email(company["user_id"]),
-            success_url="https://netcost.ai/gateway?billing=success",
-            cancel_url="https://netcost.ai/billing/setup?billing=cancelled",
-        )
-    except Exception:
-        raise HTTPException(status_code=500, detail="Failed to start checkout")
-
-    return {"url": session.url}
-
-
-@app.post("/v1/billing/portal")
-async def billing_portal(company: dict = Depends(require_admin)):
-    result = supabase.table("companies").select("stripe_customer_id").eq("id", company["company_id"]).execute()
-    if not result.data or not result.data[0]["stripe_customer_id"]:
-        raise HTTPException(status_code=400, detail="No billing account found")
-
-    try:
-        session = stripe.billing_portal.Session.create(
-            customer=result.data[0]["stripe_customer_id"],
-            return_url="https://netcost.ai/gateway",
-        )
-    except Exception:
-        raise HTTPException(status_code=500, detail="Failed to open billing portal")
-
-    return {"url": session.url}
-
-
-@app.post("/v1/billing/webhook")
-async def stripe_webhook(request: Request, stripe_signature: str = Header(None, alias="stripe-signature")):
-    if not STRIPE_WEBHOOK_SECRET:
-        raise HTTPException(status_code=500, detail="Webhook not configured yet")
-
-    payload = await request.body()
-
-    try:
-        event = stripe.Webhook.construct_event(payload, stripe_signature, STRIPE_WEBHOOK_SECRET)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid webhook signature")
-
-    event_type = event["type"]
-    data = event["data"]["object"]
-
-    if event_type == "checkout.session.completed":
-        company_id = getattr(data, "client_reference_id", None)
-        if company_id:
-            supabase.table("companies").update({
-                "stripe_customer_id": getattr(data, "customer", None),
-                "stripe_subscription_id": getattr(data, "subscription", None),
-                "subscription_status": "trialing",
-            }).eq("id", company_id).execute()
-
-    elif event_type in ("customer.subscription.updated", "customer.subscription.created"):
-        subscription_id = getattr(data, "id", None)
-        status = getattr(data, "status", None)
-        if subscription_id:
-            supabase.table("companies").update({"subscription_status": status}).eq(
-                "stripe_subscription_id", subscription_id
-            ).execute()
-
-    elif event_type == "customer.subscription.deleted":
-        subscription_id = getattr(data, "id", None)
-        if subscription_id:
-            supabase.table("companies").update({"subscription_status": "canceled"}).eq(
-                "stripe_subscription_id", subscription_id
-            ).execute()
-
-    return {"received": True}
+        {response && (
+          <div className="rounded-xl border border-border bg-surface p-5 text-sm leading-relaxed">
+            <ReactMarkdown
+              components={{
+                p: ({ children }) => <p className="mb-3 last:mb-0">{children}</p>,
+                strong: ({ children }) => <strong className="font-semibold text-foreground">{children}</strong>,
+                em: ({ children }) => <em className="italic">{children}</em>,
+                ul: ({ children }) => <ul className="list-disc list-outside pl-5 mb-3 space-y-1">{children}</ul>,
+                ol: ({ children }) => <ol className="list-decimal list-outside pl-5 mb-3 space-y-1">{children}</ol>,
+                li: ({ children }) => <li>{children}</li>,
+                h1: ({ children }) => <h1 className="text-lg font-semibold mb-2 mt-4 first:mt-0">{children}</h1>,
+                h2: ({ children }) => <h2 className="text-base font-semibold mb-2 mt-4 first:mt-0">{children}</h2>,
+                h3: ({ children }) => <h3 className="text-sm font-semibold mb-2 mt-3 first:mt-0">{children}</h3>,
+                code: ({ children }) => (
+                  <code className="bg-background border border-border rounded px-1.5 py-0.5 text-xs font-mono">
+                    {children}
+                  </code>
+                ),
+                a: ({ children, href }) => (
+                  <a href={href} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
+                    {children}
+                  </a>
+                ),
+              }}
+            >
+              {response}
+            </ReactMarkdown>
+          </div>
+        )}
+      </section>
+    </>
+  );
+}
