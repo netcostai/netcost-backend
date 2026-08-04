@@ -464,7 +464,7 @@ async def chat_proxy(request: ChatRequest, company: dict = Depends(require_subsc
                 usage_holder["output_tokens"],
             )
 
- def sse_wrap():
+    def sse_wrap():
         for chunk in generate():
             yield f"data: {chunk}\n\n"
         yield "data: [DONE]\n\n"
