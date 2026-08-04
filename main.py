@@ -5,6 +5,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 from supabase import create_client
@@ -163,37 +164,43 @@ def require_subscribed(company: dict = Depends(require_active)) -> dict:
     return company
 
 
-def call_openai(api_key: str, model: str, prompt: str, max_tokens: int):
+def stream_openai(api_key: str, model: str, prompt: str, max_tokens: int, usage_holder: dict):
     client = OpenAI(api_key=api_key)
-    completion = client.chat.completions.create(
+    stream = client.responses.create(
         model=model,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=max_tokens,
+        input=prompt,
+        max_output_tokens=max_tokens,
+        tools=[{"type": "web_search"}],
+        stream=True,
     )
-    text = completion.choices[0].message.content
-    usage = completion.usage
-    input_tokens = usage.prompt_tokens if usage else None
-    output_tokens = usage.completion_tokens if usage else None
-    return text, input_tokens, output_tokens
+    for event in stream:
+        if event.type == "response.output_text.delta":
+            yield event.delta
+        elif event.type == "response.completed":
+            usage = getattr(event.response, "usage", None)
+            usage_holder["input_tokens"] = getattr(usage, "input_tokens", None) if usage else None
+            usage_holder["output_tokens"] = getattr(usage, "output_tokens", None) if usage else None
 
 
-def call_anthropic(api_key: str, model: str, prompt: str, max_tokens: int):
+def stream_anthropic(api_key: str, model: str, prompt: str, max_tokens: int, usage_holder: dict):
     client = Anthropic(api_key=api_key)
-    message = client.messages.create(
+    with client.messages.stream(
         model=model,
         max_tokens=max_tokens,
         messages=[{"role": "user", "content": prompt}],
-    )
-    text = message.content[0].text
-    input_tokens = message.usage.input_tokens if message.usage else None
-    output_tokens = message.usage.output_tokens if message.usage else None
-    return text, input_tokens, output_tokens
+        tools=[{"type": "web_search_20260318", "name": "web_search"}],
+    ) as stream:
+        for text in stream.text_stream:
+            yield text
+        final_message = stream.get_final_message()
+        usage_holder["input_tokens"] = final_message.usage.input_tokens if final_message.usage else None
+        usage_holder["output_tokens"] = final_message.usage.output_tokens if final_message.usage else None
 
 
-def call_google(api_key: str, model: str, prompt: str, max_tokens: int):
+def stream_google(api_key: str, model: str, prompt: str, max_tokens: int, usage_holder: dict):
     client = genai.Client(api_key=api_key)
     grounding_tool = genai_types.Tool(google_search=genai_types.GoogleSearch())
-    response = client.models.generate_content(
+    response_stream = client.models.generate_content_stream(
         model=model,
         contents=prompt,
         config=genai_types.GenerateContentConfig(
@@ -202,17 +209,18 @@ def call_google(api_key: str, model: str, prompt: str, max_tokens: int):
             tools=[grounding_tool],
         ),
     )
-    text = response.text
-    usage = response.usage_metadata
-    input_tokens = usage.prompt_token_count if usage else None
-    output_tokens = usage.candidates_token_count if usage else None
-    return text, input_tokens, output_tokens
+    for chunk in response_stream:
+        if chunk.text:
+            yield chunk.text
+        if chunk.usage_metadata:
+            usage_holder["input_tokens"] = chunk.usage_metadata.prompt_token_count
+            usage_holder["output_tokens"] = chunk.usage_metadata.candidates_token_count
 
 
-PROVIDER_HANDLERS = {
-    "openai": call_openai,
-    "anthropic": call_anthropic,
-    "google": call_google,
+STREAM_HANDLERS = {
+    "openai": stream_openai,
+    "anthropic": stream_anthropic,
+    "google": stream_google,
 }
 
 
@@ -427,8 +435,8 @@ async def chat_proxy(request: ChatRequest, company: dict = Depends(require_subsc
     if not result.data:
         raise HTTPException(status_code=404, detail=f"No {request.provider} key connected")
 
-    handler = PROVIDER_HANDLERS.get(request.provider)
-    if not handler:
+    stream_handler = STREAM_HANDLERS.get(request.provider)
+    if not stream_handler:
         raise HTTPException(status_code=500, detail=f"Unsupported provider: {request.provider}")
 
     try:
@@ -438,15 +446,25 @@ async def chat_proxy(request: ChatRequest, company: dict = Depends(require_subsc
 
     model = request.model or DEFAULT_MODELS[request.provider]
 
-    try:
-        text, input_tokens, output_tokens = handler(decrypted_key, model, request.prompt, request.max_tokens)
-    except Exception as e:
-        print(f"ERROR calling {request.provider} ({model}): {type(e).__name__}: {e}")
-        raise HTTPException(status_code=500, detail="Provider request failed")
+    def generate():
+        usage_holder = {"input_tokens": None, "output_tokens": None}
+        try:
+            for chunk in stream_handler(decrypted_key, model, request.prompt, request.max_tokens, usage_holder):
+                yield chunk
+        except Exception as e:
+            print(f"ERROR streaming {request.provider} ({model}): {type(e).__name__}: {e}")
+            yield "\n\n[This response was interrupted by an error.]"
+        finally:
+            log_usage(
+                company["company_id"],
+                company["user_id"],
+                request.provider,
+                model,
+                usage_holder["input_tokens"],
+                usage_holder["output_tokens"],
+            )
 
-    log_usage(company["company_id"], company["user_id"], request.provider, model, input_tokens, output_tokens)
-
-    return {"response": text}
+    return StreamingResponse(generate(), media_type="text/plain")
 
 
 @app.get("/v1/usage/summary")
