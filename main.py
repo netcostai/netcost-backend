@@ -47,7 +47,7 @@ stripe.api_key = STRIPE_SECRET_KEY
 DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5-20251001",
-    "google": "gemini-2.5-flash",
+    "google": "gemini-3.6-flash",
 }
 
 RATE_LIMIT_WINDOW_SECONDS = 60
