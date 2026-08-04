@@ -464,12 +464,16 @@ async def chat_proxy(request: ChatRequest, company: dict = Depends(require_subsc
                 usage_holder["output_tokens"],
             )
 
+ def sse_wrap():
+        for chunk in generate():
+            yield f"data: {chunk}\n\n"
+        yield "data: [DONE]\n\n"
+
     return StreamingResponse(
-        generate(),
-        media_type="text/plain",
+        sse_wrap(),
+        media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
         },
     )
