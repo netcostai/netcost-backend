@@ -192,12 +192,14 @@ def call_anthropic(api_key: str, model: str, prompt: str, max_tokens: int):
 
 def call_google(api_key: str, model: str, prompt: str, max_tokens: int):
     client = genai.Client(api_key=api_key)
+    grounding_tool = genai_types.Tool(google_search=genai_types.GoogleSearch())
     response = client.models.generate_content(
         model=model,
         contents=prompt,
         config=genai_types.GenerateContentConfig(
             max_output_tokens=max_tokens,
             thinking_config=genai_types.ThinkingConfig(thinking_level="low"),
+            tools=[grounding_tool],
         ),
     )
     text = response.text
