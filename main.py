@@ -50,9 +50,6 @@ DEFAULT_MODELS = {
     "google": "gemini-2.5-flash",
 }
 
-# --- Burst rate limiting (protects against runaway loops/bugs) ---
-# In-memory, per-process. Fine for a single Render instance; if this ever
-# scales to multiple instances, this needs to move to a shared store (e.g. Redis).
 RATE_LIMIT_WINDOW_SECONDS = 60
 RATE_LIMIT_MAX_REQUESTS = 20
 
@@ -438,7 +435,8 @@ async def chat_proxy(request: ChatRequest, company: dict = Depends(require_subsc
 
     try:
         text, input_tokens, output_tokens = handler(decrypted_key, model, request.prompt, request.max_tokens)
-    except Exception:
+    except Exception as e:
+        print(f"ERROR calling {request.provider} ({model}): {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Provider request failed")
 
     log_usage(company["company_id"], company["user_id"], request.provider, model, input_tokens, output_tokens)
