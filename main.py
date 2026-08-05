@@ -1,5 +1,6 @@
 import os
 import time
+import base64
 import threading
 from collections import defaultdict, deque
 from datetime import datetime, timezone
@@ -48,6 +49,14 @@ DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5-20251001",
     "google": "gemini-3.6-flash",
+}
+
+# Only providers with an actual image-generation model. Claude has no
+# native image generation as of this writing — Anthropic has deliberately
+# not built one, so this isn't something a key/config change can add.
+IMAGE_MODELS = {
+    "openai": "gpt-image-2",
+    "google": "gemini-2.5-flash-image",
 }
 
 RATE_LIMIT_WINDOW_SECONDS = 60
@@ -99,6 +108,7 @@ class ChatRequest(BaseModel):
     prompt: str
     model: Optional[str] = None
     max_tokens: int = 2000
+    mode: str = "text"  # "text" or "image"
 
 
 class CompleteSignupRequest(BaseModel):
@@ -215,6 +225,31 @@ PROVIDER_HANDLERS = {
     "openai": call_openai,
     "anthropic": call_anthropic,
     "google": call_google,
+}
+
+
+def generate_image_openai(api_key: str, model: str, prompt: str) -> str:
+    client = OpenAI(api_key=api_key)
+    result = client.images.generate(model=model, prompt=prompt, n=1, size="1024x1024")
+    return result.data[0].b64_json
+
+
+def generate_image_google(api_key: str, model: str, prompt: str) -> str:
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(response_modalities=["Text", "Image"]),
+    )
+    for part in response.candidates[0].content.parts:
+        if part.inline_data is not None:
+            return base64.b64encode(part.inline_data.data).decode("utf-8")
+    raise ValueError("No image was returned for this prompt.")
+
+
+IMAGE_HANDLERS = {
+    "openai": generate_image_openai,
+    "google": generate_image_google,
 }
 
 
@@ -429,14 +464,31 @@ async def chat_proxy(request: ChatRequest, company: dict = Depends(require_subsc
     if not result.data:
         raise HTTPException(status_code=404, detail=f"No {request.provider} key connected")
 
-    handler = PROVIDER_HANDLERS.get(request.provider)
-    if not handler:
-        raise HTTPException(status_code=500, detail=f"Unsupported provider: {request.provider}")
-
     try:
         decrypted_key = decrypt_key(result.data[0]["encrypted_provider_key"])
     except Exception:
         raise HTTPException(status_code=500, detail="Unable to process request")
+
+    if request.mode == "image":
+        image_handler = IMAGE_HANDLERS.get(request.provider)
+        if not image_handler:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{request.provider} does not support image generation.",
+            )
+        model = request.model or IMAGE_MODELS[request.provider]
+        try:
+            image_base64 = image_handler(decrypted_key, model, request.prompt)
+        except Exception as e:
+            print(f"ERROR generating image {request.provider} ({model}): {type(e).__name__}: {e}")
+            raise HTTPException(status_code=500, detail="Image generation failed")
+
+        log_usage(company["company_id"], company["user_id"], request.provider, model, None, None)
+        return {"type": "image", "image_base64": image_base64}
+
+    handler = PROVIDER_HANDLERS.get(request.provider)
+    if not handler:
+        raise HTTPException(status_code=500, detail=f"Unsupported provider: {request.provider}")
 
     model = request.model or DEFAULT_MODELS[request.provider]
 
@@ -448,7 +500,7 @@ async def chat_proxy(request: ChatRequest, company: dict = Depends(require_subsc
 
     log_usage(company["company_id"], company["user_id"], request.provider, model, input_tokens, output_tokens)
 
-    return {"response": text}
+    return {"type": "text", "response": text}
 
 
 @app.get("/v1/usage/summary")
